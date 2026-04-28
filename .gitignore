@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Swift Package Manager
+/.build/
+/.swiftpm/
+/Packages/
+*.xcodeproj/xcuserdata/
+
+# Bundled output
+/build/
+
+# Local tooling
+/.omc/
