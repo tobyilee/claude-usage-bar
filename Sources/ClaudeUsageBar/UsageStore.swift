@@ -22,6 +22,10 @@ final class UsageStore {
     @ObservationIgnored private var wakeup: CheckedContinuation<Void, Never>?
     @ObservationIgnored private var wakeupGeneration: UInt64 = 0
     @ObservationIgnored private var nextAllowedFetch: Date?
+    /// Process-lifetime cache of Keychain creds. Avoids re-prompting on unsigned builds
+    /// and skips the Security framework round-trip on every poll. Invalidated only when
+    /// we get a 401 we can't refresh past — i.e. the CLI rotated the refresh token externally.
+    @ObservationIgnored private var cachedCreds: StoredCreds?
 
     func start() {
         guard pollTask == nil else { return }
@@ -75,7 +79,7 @@ final class UsageStore {
     }
 
     private func tickOnceCore() async throws {
-        var creds = try KeychainCredentials.read()
+        var creds = try loadCreds()
         if let exp = creds.expiresAt, exp.timeIntervalSinceNow < 300 {
             creds = try await refreshAndPersist(creds)
         }
@@ -84,7 +88,15 @@ final class UsageStore {
         do {
             usageResp = try await AnthropicClient.shared.fetchUsage(token: creds.accessToken)
         } catch AnthropicError.unauthorized {
-            creds = try await refreshAndPersist(creds)
+            do {
+                creds = try await refreshAndPersist(creds)
+            } catch {
+                // Refresh token may have been rotated by the `claude` CLI behind our back.
+                // Drop the cache, re-read Keychain once, and try refreshing again.
+                cachedCreds = nil
+                creds = try loadCreds()
+                creds = try await refreshAndPersist(creds)
+            }
             usageResp = try await AnthropicClient.shared.fetchUsage(token: creds.accessToken)
         }
 
@@ -92,7 +104,7 @@ final class UsageStore {
         self.lastUpdated = Date()
         self.lastError = nil
         self.nextAllowedFetch = nil
-        self.menubarState = .ok(percent: highestPercent(usageResp))
+        self.menubarState = .ok(percent: sessionPercent(usageResp))
 
         if self.tier == nil {
             if let t = creds.subscriptionType, !t.isEmpty {
@@ -133,6 +145,13 @@ final class UsageStore {
         }
     }
 
+    private func loadCreds() throws -> StoredCreds {
+        if let c = cachedCreds { return c }
+        let c = try KeychainCredentials.read()
+        cachedCreds = c
+        return c
+    }
+
     private func refreshAndPersist(_ creds: StoredCreds) async throws -> StoredCreds {
         let resp = try await AnthropicClient.shared.refreshTokens(refreshToken: creds.refreshToken)
         let newRefresh = resp.refresh_token ?? creds.refreshToken
@@ -147,10 +166,11 @@ final class UsageStore {
         updated.accessToken = resp.access_token
         updated.refreshToken = newRefresh
         updated.expiresAt = newExpires
+        cachedCreds = updated
         return updated
     }
 
-    private func highestPercent(_ u: UsageResponse) -> Int {
-        max(u.five_hour?.utilization ?? 0, u.seven_day?.utilization ?? 0)
+    private func sessionPercent(_ u: UsageResponse) -> Int {
+        u.five_hour?.utilization ?? 0
     }
 }
